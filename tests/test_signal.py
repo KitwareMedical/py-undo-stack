@@ -1,3 +1,5 @@
+import asyncio
+import logging
 from unittest.mock import MagicMock
 
 import pytest
@@ -295,3 +297,93 @@ def test_bound_slots_are_not_connected_twice():
     s.connect(a.bound)
     s.emit()
     mock.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_can_be_connected_to_async_methods():
+    mock = MagicMock()
+
+    async def async_slot(*args, **kwargs):
+        await asyncio.sleep(0.05)
+        mock(*args, **kwargs)
+
+    s = Signal()
+    s.connect(async_slot)
+    s.emit(42, kw=43)
+    await asyncio.sleep(0.1)
+    mock.assert_called_once_with(42, kw=43)
+
+    mock.reset_mock()
+    s.disconnect(async_slot)
+    s.emit(43)
+    await asyncio.sleep(0.1)
+    mock.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_captures_exceptions_in_async_io_to_logging_error(caplog):
+    with caplog.at_level(logging.ERROR):
+
+        async def async_slot():
+            await asyncio.sleep(0.01)
+            _error_msg = "Error happened"
+            raise ValueError(_error_msg)
+
+        s = Signal()
+        s.connect(async_slot)
+        s.emit()
+        await asyncio.sleep(0.1)
+
+    assert "Error happened" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_can_be_awaited_when_emitting_in_async_context():
+    mock = MagicMock()
+    sync_mock = MagicMock()
+
+    async def async_slot(*args, **kwargs):
+        await asyncio.sleep(0.05)
+        mock(*args, **kwargs)
+
+    def sync_slot(*args, **kwargs):
+        sync_mock(*args, **kwargs)
+
+    s = Signal()
+    s.connect(async_slot)
+    s.connect(sync_slot)
+    await s.async_emit(42, kw=43)
+    mock.assert_called_once_with(42, kw=43)
+    sync_mock.assert_called_once_with(42, kw=43)
+
+    mock.reset_mock()
+    sync_mock.reset_mock()
+    s = Signal()
+    s.disconnect(async_slot)
+    s.disconnect(sync_slot)
+    await s.async_emit(52)
+
+    mock.assert_not_called()
+    sync_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_can_async_emit_once():
+    s = Signal()
+    mock = MagicMock()
+
+    async def async_slot(*args, **kwargs):
+        await asyncio.sleep(0.05)
+        mock(*args, **kwargs)
+
+    s.connect(async_slot)
+
+    async with s.async_emit_once():
+        await s.async_emit(-1, kw=-1)
+
+        async with s.async_emit_once():
+            for i in range(42):
+                await asyncio.sleep(0.01)
+                await s.async_emit(i, kw=i)
+
+    mock.assert_called_once_with(41, kw=41)

@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Generator
-from contextlib import (
-    AbstractContextManager,
-    contextmanager,
-)
+import asyncio
+import inspect
+import logging
+from asyncio import Task
+from collections.abc import Callable, Coroutine, Generator
+from contextlib import asynccontextmanager, contextmanager
 from itertools import count
 from weakref import WeakMethod
 
@@ -40,10 +41,27 @@ class Slot:
         """
         if self.is_obsolete():
             return
-        self.slot(*args, **kwargs)
+        result = self.slot(*args, **kwargs)
+        if inspect.iscoroutine(result):
+            task = asyncio.create_task(result)
+            task.add_done_callback(self._log_async_exceptions)
+
+    @staticmethod
+    def _log_async_exceptions(task: Task):
+        exc = task.exception()
+        if exc:
+            _error_msg = "Unhandled async exception in slot: "
+            logging.error(_error_msg, exc_info=exc)
+
+    async def async_call(self, *args, **kwargs):
+        if self.is_obsolete():
+            return
+        result = self.slot(*args, **kwargs)
+        if inspect.isawaitable(result):
+            await result
 
     @property
-    def slot(self) -> Callable[...] | None:
+    def slot(self) -> Callable[...] | Coroutine[...] | None:
         """
         Retrieves the actual callable stored in this slot.
 
@@ -116,16 +134,30 @@ class Signal:
         If signal is currently blocked, will not forward to the slots.
         If signal call args are retained, will store last args regardless of block status.
         """
-        if self._is_retaining_call_args:
-            self._last_call_args = (args, kwargs)
-
-        self._remove_obsolete_slots()
-
+        self._prepare_emit(*args, **kwargs)
         if self._is_signal_blocked:
             return
 
         for slot in self._slots():
             slot(*args, **kwargs)
+
+    def _prepare_emit(self, *args, **kwargs):
+        if self._is_retaining_call_args:
+            self._last_call_args = (args, kwargs)
+        self._remove_obsolete_slots()
+
+    async def async_emit(self, *args, **kwargs):
+        """
+        Emits the signal to all connected, non-obsolete, slots with the input args, kwargs.
+        If signal is currently blocked, will not forward to the slots.
+        If signal call args are retained, will store last args regardless of block status.
+        """
+        self._prepare_emit(*args, **kwargs)
+        if self._is_signal_blocked:
+            return
+
+        for slot in self._slots():
+            await slot.async_call(*args, **kwargs)
 
     def connect(self, *slots) -> int | list[int]:
         """
@@ -261,7 +293,7 @@ class Signal:
             self._retain_last_call_args(was_retained)
 
     @contextmanager
-    def emit_once(self) -> AbstractContextManager:
+    def emit_once(self):
         """
         Context manager allowing to only emit once during context execution.
         Signal emit will be done with the last call args after context exits.
@@ -277,8 +309,25 @@ class Signal:
         args, kwargs = last_args
         self.emit(*args, **kwargs)
 
+    @asynccontextmanager
+    async def async_emit_once(self):
+        """
+        Context manager allowing to only emit once during async context execution.
+        Signal emit will be done with the last call args after context exits.
+        """
+        last_args = []
+        with self._last_args_retained(last_args), self.emit_blocked() as was_blocked:
+            yield
+
+        last_args = last_args[0]
+        if was_blocked or last_args is None:
+            return
+
+        args, kwargs = last_args
+        await self.async_emit(*args, **kwargs)
+
     @contextmanager
-    def emit_blocked(self) -> AbstractContextManager:
+    def emit_blocked(self):
         """
         Context manager allowing to block signal during context execution.
         """
